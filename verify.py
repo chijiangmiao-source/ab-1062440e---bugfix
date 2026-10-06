@@ -262,6 +262,124 @@ def scenario_interruption_recovery(ctx):
     check(len(s["records"]) == 6, "新纪元记录应完整")
 
 
+# ---------------------------------------------------------------- 场景四
+
+def _drive_migration(ctx, ws, page, version, batch=10):
+    """发起并完成一次目标版本迁移，返回发布后的状态。"""
+    _, s = req(ctx, "POST", f"/api/workspaces/{ws}/migration/start",
+               {"page_id": page, "target_version": version}, expect=200)
+    check(s["migration"]["phase"] == "copying", "迁移应进入复制阶段")
+    while True:
+        _, s = req(ctx, "POST", f"/api/workspaces/{ws}/migration/copy",
+                   {"page_id": page, "batch_size": batch}, expect=200)
+        if s["migration"]["phase"] == "validating":
+            break
+    req(ctx, "POST", f"/api/workspaces/{ws}/migration/validate",
+        {"page_id": page}, expect=200)
+    _, s = req(ctx, "POST", f"/api/workspaces/{ws}/migration/publish",
+               {"page_id": page}, expect=200)
+    check(s["migration"]["phase"] == "published", "迁移应已发布")
+    return s
+
+
+@step("场景四：保留保存恢复——已提交恰好一次 / 未提交旧纪元拒绝 / 标识冲突")
+def scenario_pending_save_recovery(ctx):
+    ws_name = f"verify-pending-{uuid.uuid4().hex[:8]}"
+    ws = req(ctx, "POST", "/api/workspaces", {"name": ws_name}, expect=201)[1]
+    ws_id = ws["id"]
+    epoch1 = ws["current_epoch"]["id"]
+    page_a = req(ctx, "POST", f"/api/workspaces/{ws_id}/pages", expect=201)[1]["page_id"]
+    # 普通新记录（无 save_id）保持既有行为
+    for i in range(2):
+        req(ctx, "POST", f"/api/workspaces/{ws_id}/records",
+            {"page_id": page_a, "content": f"基线-{i + 1}"}, expect=201)
+    # 另一页（离线页），持有旧纪元围栏
+    page_b = req(ctx, "POST", f"/api/workspaces/{ws_id}/pages", expect=201)[1]["page_id"]
+
+    # —— 情形一：已提交但未获回执（请求在迁移前已落库，客户端没收到结果）——
+    save_committed = f"save-{uuid.uuid4().hex}"
+    code, r = req(ctx, "POST", f"/api/workspaces/{ws_id}/records",
+                  {"page_id": page_b, "content": "已提交离线记录",
+                   "save_id": save_committed, "origin_epoch_id": epoch1})
+    check(code == 201 and r.get("replayed") is False, f"首次接受异常: {code} {r}")
+    committed_seq = r["seq"]
+
+    # 另一页完成目标版本迁移并发布
+    s = _drive_migration(ctx, ws_id, page_a, "v2")
+    check(s["current_epoch"]["number"] == 2, "应发布到纪元 #2")
+    check(len(s["records"]) == 3, f"新纪元应恰好复制 3 条: {len(s['records'])}")
+
+    # 旧页B 已被失效，但它重放自己那条【已接受】保存：仍稳定返回同一业务结果
+    states = {p["id"]: p["state"] for p in s["pages"]}
+    check(states[page_b] == "invalidated", "旧页B 应已失效")
+    code, r2 = req(ctx, "POST", f"/api/workspaces/{ws_id}/records",
+                   {"page_id": page_b, "content": "已提交离线记录",
+                    "save_id": save_committed, "origin_epoch_id": epoch1})
+    check(code == 201 and r2.get("replayed") is True, f"已接受保存应稳定重放: {code} {r2}")
+    check(r2["seq"] == committed_seq and r2["content"] == "已提交离线记录",
+          "重放应返回同一业务结果（seq/内容）")
+
+    # 重开页B（新页面，持有新纪元围栏），再次恢复：仍恰好一次，不新增记录
+    page_c = req(ctx, "POST", f"/api/workspaces/{ws_id}/pages", expect=201)[1]["page_id"]
+    code, r3 = req(ctx, "POST", f"/api/workspaces/{ws_id}/records",
+                   {"page_id": page_c, "content": "已提交离线记录",
+                    "save_id": save_committed, "origin_epoch_id": epoch1})
+    check(code == 201 and r3.get("replayed") is True, f"重开后重放异常: {code} {r3}")
+    check(r3["id"] == r2["id"] and r3["seq"] == committed_seq, "重放结果必须稳定")
+    _, s = req(ctx, "GET", f"/api/workspaces/{ws_id}/state", expect=200)
+    check(len(s["records"]) == 3, f"迁移后重放不得重复记录，仍应为 3 条: {len(s['records'])}")
+
+    # —— 情形二：未提交即断线（请求从未到达服务端）——
+    # 借重开的新页面（活动、持新纪元围栏）发送一个指向旧纪元、从未接受的保存
+    save_lost = f"save-{uuid.uuid4().hex}"
+    code, err = req(ctx, "POST", f"/api/workspaces/{ws_id}/records",
+                    {"page_id": page_c, "content": "断线未达记录",
+                     "save_id": save_lost, "origin_epoch_id": epoch1})
+    check(code == 409 and err.get("error") == "stale_epoch",
+          f"未提交的旧纪元保存必须被拒绝: {code} {err}")
+    _, s = req(ctx, "GET", f"/api/workspaces/{ws_id}/state", expect=200)
+    check(len(s["records"]) == 3, "旧纪元拒绝不得产生新纪元记录")
+    check(not any(r["content"] == "断线未达记录" for r in s["records"]),
+          "断线未达记录不得借新页面落库")
+
+    # 已失效的旧页B 发送另一条【全新】保存：仍按页面围栏拒绝（两页面旧写拒绝）
+    save_new = f"save-{uuid.uuid4().hex}"
+    code, err = req(ctx, "POST", f"/api/workspaces/{ws_id}/records",
+                    {"page_id": page_b, "content": "旧页另一条新保存",
+                     "save_id": save_new, "origin_epoch_id": epoch1})
+    check(code == 409 and err.get("error") == "page_not_active",
+          f"失效旧页的新保存应被拒绝: {code} {err}")
+
+    # —— 情形三：相同稳定保存标识但内容不同 = 明确冲突 ——
+    epoch2 = s["current_epoch"]["id"]
+    save_conf = f"save-{uuid.uuid4().hex}"
+    req(ctx, "POST", f"/api/workspaces/{ws_id}/records",
+        {"page_id": page_c, "content": "冲突原稿",
+         "save_id": save_conf, "origin_epoch_id": epoch2}, expect=201)
+    _drive_migration(ctx, ws_id, page_c, "v3")
+    page_e = req(ctx, "POST", f"/api/workspaces/{ws_id}/pages", expect=201)[1]["page_id"]
+    before_conf = req(ctx, "GET", f"/api/workspaces/{ws_id}/state", expect=200)[1]
+    code, err = req(ctx, "POST", f"/api/workspaces/{ws_id}/records",
+                    {"page_id": page_e, "content": "被篡改内容",
+                     "save_id": save_conf, "origin_epoch_id": epoch2})
+    check(code == 409 and err.get("error") == "save_id_conflict",
+          f"同标识不同内容必须明确冲突: {code} {err}")
+    _, after_conf = req(ctx, "GET", f"/api/workspaces/{ws_id}/state", expect=200)
+    check(len(after_conf["records"]) == len(before_conf["records"]),
+          "冲突不得新增记录")
+    check(not any(r["content"] == "被篡改内容" for r in after_conf["records"]),
+          "冲突内容不得落库")
+    # 相同内容重放仍返回同一结果
+    code, rc = req(ctx, "POST", f"/api/workspaces/{ws_id}/records",
+                   {"page_id": page_e, "content": "冲突原稿",
+                    "save_id": save_conf, "origin_epoch_id": epoch2})
+    check(code == 201 and rc.get("replayed") is True and rc["content"] == "冲突原稿",
+          f"同内容应能稳定重放: {code} {rc}")
+    ctx["pending_ws"] = ws_id
+    ctx["pending_page"] = page_e
+    ctx["pending_save"] = save_committed  # 供重启场景复核
+
+
 # ---------------------------------------------------------------- 场景三
 
 @step("场景三：发布后进程重启，本地恢复的纪元/记录/失效状态一致")
@@ -290,6 +408,26 @@ def scenario_restart_consistency(ctx):
     inv_after = {p["id"] for p in after["pages"] if p["state"] == "invalidated"}
     check(inv_before and inv_before <= inv_after, "失效页面状态不一致")
 
+    # 重启后，保留保存的稳定标识仍然有效：同标识重放依旧恰好一次、不重复记录。
+    pending_ws = ctx.get("pending_ws")
+    pending_save = ctx.get("pending_save")
+    if pending_ws and pending_save:
+        p0 = req(ctx, "POST", f"/api/workspaces/{pending_ws}/pages", expect=201)[1]
+        before_records = req(ctx, "GET", f"/api/workspaces/{pending_ws}/state",
+                             expect=200)[1]["records"]
+        # origin_epoch_id 用最初的旧纪元也无妨：已接受标识优先重放
+        code, rr = req(ctx, "POST", f"/api/workspaces/{pending_ws}/records",
+                       {"page_id": p0["page_id"], "content": "已提交离线记录",
+                        "save_id": pending_save, "origin_epoch_id": ""})
+        check(code == 201 and rr.get("replayed") is True,
+              f"重启后已接受保存应仍稳定重放: {code} {rr}")
+        after_records = req(ctx, "GET", f"/api/workspaces/{pending_ws}/state",
+                            expect=200)[1]["records"]
+        check(len(after_records) == len(before_records),
+              "重启后重放不得重复记录")
+        check([r["content"] for r in after_records] ==
+              [r["content"] for r in before_records], "重启后记录内容不一致")
+
 
 # ---------------------------------------------------------------- 主流程
 
@@ -304,7 +442,7 @@ def main():
     print(f"[verify] 目标 {ctx['base']}", flush=True)
     steps = [build_check, unit_tests, smoke_health, smoke_pages, smoke_api,
              scenario_stale_write_rejected, scenario_interruption_recovery,
-             scenario_restart_consistency]
+             scenario_pending_save_recovery, scenario_restart_consistency]
     for s in steps:
         s(ctx)
 

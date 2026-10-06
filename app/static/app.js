@@ -62,15 +62,30 @@ async function submitRecord(content) {
 }
 
 async function flushPendingSaves() {
+  // 重开后恢复保留的保存。三种终态：
+  //  - 服务端已接受（含已跨纪元）：稳定返回同一结果（replayed），本地移除；
+  //  - 旧纪元保存（stale_epoch）/ 同标识内容冲突（save_id_conflict）：
+  //    属于不可重试的明确拒绝，移除并要求重新载入核对；
+  //  - 网络层失败（无 HTTP 状态）：保留在本地，下次再试。
+  const terminal = [];
   for (const save of readPendingSaves()) {
     try {
-      await sendRecord(save);
+      const r = await sendRecord(save);
       removePendingSave(save.id);
+      if (r.replayed) terminal.push(`保存「${save.content}」此前已落库，未重复记录`);
     } catch (e) {
-      if (!e.status) return;
+      if (!e.status) return; // 断线未决：保留，等待下次恢复
       removePendingSave(save.id);
+      if (e.code === "stale_epoch") {
+        terminal.push(`保存「${save.content}」属于旧纪元，已被拒绝，请重新载入`);
+      } else if (e.code === "save_id_conflict") {
+        terminal.push(`保存「${save.content}」标识冲突（同标识内容不同），请重新载入核对`);
+      } else {
+        terminal.push(`保存「${save.content}」被拒绝：${e.message}`);
+      }
     }
   }
+  if (terminal.length) showBanner(terminal.join("；"), true);
 }
 
 async function api(method, path, body) {

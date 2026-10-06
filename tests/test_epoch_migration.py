@@ -228,6 +228,160 @@ class StoreTestCase(unittest.TestCase):
         self.assertEqual(states[page_b], "invalidated")
         self.assertEqual(after["migration"]["phase"], "published")
 
+    # ------------------------------------------------ 稳定保存标识（离线恢复）
+
+    def _commit_without_receipt(self, ws_id, page, content, save_id, epoch_id):
+        """模拟「已提交但未获回执」：直接落库并建立稳定标识，客户端未收到结果。"""
+        return self.store.add_record(ws_id, page, content, save_id, epoch_id)
+
+    def test_committed_save_replays_once_after_migration(self):
+        """已提交未获回执：迁移后恢复只能稳定返回同一结果，绝不重复记录。"""
+        ws, page_a = self.make_ws(record_count=2)
+        epoch1 = ws["current_epoch"]["id"]
+        page_b = self.store.open_page(ws["id"])["page_id"]
+
+        # 页B 的保存已在迁移前落库，但客户端未收到回执 -> 进入本地保留
+        r1 = self._commit_without_receipt(ws["id"], page_b, "离线观测-X", "save-1", epoch1)
+        self.assertFalse(r1["replayed"])
+        self.assertEqual(r1["seq"], 3)
+        before = self.store.get_state(ws["id"])
+        self.assertEqual(len(before["records"]), 3)
+
+        # 页A 完成目标版本迁移并发布
+        self.drive_to(ws["id"], page_a, "published")
+
+        # 重开页B（持有新纪元围栏）后恢复该保存：
+        # 旧页面已失效，需开新页面；恢复请求携带原 save_id 与旧纪元
+        page_c = self.store.open_page(ws["id"])["page_id"]
+        r2 = self.store.add_record(ws["id"], page_c, "离线观测-X", "save-1", epoch1)
+        self.assertTrue(r2["replayed"])
+        # 稳定返回当初接受的业务结果：同一 seq，记录 ID 指向新纪元中的同一条
+        self.assertEqual(r2["seq"], r1["seq"])
+        self.assertEqual(r2["content"], "离线观测-X")
+
+        s = self.store.get_state(ws["id"])
+        self.assertEqual(s["current_epoch"]["number"], 2)
+        # 恰好一次：新纪元只有复制来的 3 条，没有第 4 条重复记录
+        self.assertEqual(len(s["records"]), 3)
+        self.assertEqual(s["records"][-1]["content"], "离线观测-X")
+        # 再恢复一次仍是同一结果，仍不新增
+        r3 = self.store.add_record(ws["id"], page_c, "离线观测-X", "save-1", epoch1)
+        self.assertTrue(r3["replayed"])
+        self.assertEqual(r3["id"], r2["id"])
+        self.assertEqual(len(self.store.get_state(ws["id"])["records"]), 3)
+
+    def test_uncommitted_old_epoch_save_rejected_after_reopen(self):
+        """未提交即断线：请求从未到达服务端，迁移后重开放送必须被拒绝。"""
+        ws, page_a = self.make_ws(record_count=2)
+        epoch1 = ws["current_epoch"]["id"]
+        page_b = self.store.open_page(ws["id"])["page_id"]
+
+        # 页A 完成迁移（页B 的保存从未到达服务端，服务端无任何记录）
+        self.drive_to(ws["id"], page_a, "published")
+        epoch2 = self.store.get_state(ws["id"])["current_epoch"]["id"]
+        self.assertNotEqual(epoch1, epoch2)
+
+        # 重开页B（新围栏 = 新纪元），恢复一个指向旧纪元、从未被接受的保存
+        page_c = self.store.open_page(ws["id"])["page_id"]
+        err = self.assert_api_error(
+            409, "stale_epoch",
+            self.store.add_record, ws["id"], page_c, "断线观测-Y", "save-2", epoch1)
+        self.assertIn("旧纪元", err.message)
+        # 不能借新页面变成新纪元写入
+        s = self.store.get_state(ws["id"])
+        self.assertEqual(len(s["records"]), 2)
+        self.assertFalse(any(r["content"] == "断线观测-Y" for r in s["records"]))
+        refs = self.store.conn.execute(
+            "SELECT COUNT(*) AS c FROM save_refs WHERE save_id=?", ("save-2",)).fetchone()["c"]
+        self.assertEqual(refs, 0)
+
+    def test_same_save_id_different_content_conflicts(self):
+        """相同稳定保存标识但内容不同：必须明确冲突，不能当作重放或新记录。"""
+        ws, page = self.make_ws(record_count=0)
+        epoch = ws["current_epoch"]["id"]
+        self.store.add_record(ws["id"], page, "内容A", "save-9", epoch)
+        err = self.assert_api_error(
+            409, "save_id_conflict",
+            self.store.add_record, ws["id"], page, "内容B", "save-9", epoch)
+        self.assertEqual(err.extra["save_id"], "save-9")
+        # 冲突不产生新记录，仍只有最初那一条
+        s = self.store.get_state(ws["id"])
+        self.assertEqual(len(s["records"]), 1)
+        self.assertEqual(s["records"][0]["content"], "内容A")
+
+    def test_conflict_same_save_id_after_migration(self):
+        """迁移后以同标识、不同内容恢复：明确冲突，且不写入新纪元。"""
+        ws, page_a = self.make_ws(record_count=1)
+        epoch1 = ws["current_epoch"]["id"]
+        page_b = self.store.open_page(ws["id"])["page_id"]
+        self.store.add_record(ws["id"], page_b, "原稿内容", "save-7", epoch1)
+        self.drive_to(ws["id"], page_a, "published")
+
+        page_c = self.store.open_page(ws["id"])["page_id"]
+        self.assert_api_error(
+            409, "save_id_conflict",
+            self.store.add_record, ws["id"], page_c, "被篡改内容", "save-7", epoch1)
+        s = self.store.get_state(ws["id"])
+        self.assertEqual(len(s["records"]), 2)
+        self.assertFalse(any(r["content"] == "被篡改内容" for r in s["records"]))
+
+    def test_save_refs_survive_copy_interruption_and_recycle(self):
+        """复制中断回收候选：已接受保存的标识不丢失，重试仍稳定重放。"""
+        ws, page_a = self.make_ws(record_count=3)
+        epoch1 = ws["current_epoch"]["id"]
+        r1 = self.store.add_record(ws["id"], page_a, "待复制记录", "save-k", epoch1)
+        self.store.start_migration(ws["id"], page_a, "v2")
+        self.store.copy_batch(ws["id"], page_a, 1)
+        self.store.close_page(ws["id"], page_a)  # 复制中断 -> 回收候选
+
+        s = self.store.get_state(ws["id"])
+        self.assertEqual(s["migration"]["phase"], "aborted")
+        # 仍在旧纪元：标识保留，重试稳定返回同一结果
+        page_b = self.store.open_page(ws["id"])["page_id"]
+        r2 = self.store.add_record(ws["id"], page_b, "待复制记录", "save-k", epoch1)
+        self.assertTrue(r2["replayed"])
+        self.assertEqual(r2["id"], r1["id"])
+        self.assertEqual(len(self.store.get_state(ws["id"])["records"]), 4)
+
+        # 重新发起并完成迁移，标识应正确改指新纪元
+        self.drive_to(ws["id"], page_b, "published")
+        page_c = self.store.open_page(ws["id"])["page_id"]
+        r3 = self.store.add_record(ws["id"], page_c, "待复制记录", "save-k", epoch1)
+        self.assertTrue(r3["replayed"])
+        self.assertEqual(r3["seq"], r1["seq"])
+        s = self.store.get_state(ws["id"])
+        self.assertEqual(len(s["records"]), 4)
+
+    def test_replay_from_invalidated_old_page_still_returns_result(self):
+        """已接受保存的重试来自已失效旧页面，仍稳定返回结果而非被围栏拒绝。"""
+        ws, page_a = self.make_ws(record_count=2)
+        epoch1 = ws["current_epoch"]["id"]
+        page_b = self.store.open_page(ws["id"])["page_id"]
+        r1 = self.store.add_record(ws["id"], page_b, "旧页离线保存", "save-z", epoch1)
+        self.drive_to(ws["id"], page_a, "published")
+
+        # 页B 已被失效；它直接重试自己那条已落库的保存
+        states = {p["id"]: p["state"] for p in self.store.get_state(ws["id"])["pages"]}
+        self.assertEqual(states[page_b], "invalidated")
+        r2 = self.store.add_record(ws["id"], page_b, "旧页离线保存", "save-z", epoch1)
+        self.assertTrue(r2["replayed"])
+        self.assertEqual(r2["seq"], r1["seq"])
+        self.assertEqual(len(self.store.get_state(ws["id"])["records"]), 3)
+
+        # 但已失效旧页面的「新」保存（无已接受标识）仍按围栏拒绝
+        self.assert_api_error(
+            409, "page_not_active",
+            self.store.add_record, ws["id"], page_b, "旧页另一条新保存", "save-new", epoch1)
+
+    def test_normal_new_records_without_save_id_unaffected(self):
+        """无 save_id 的普通新记录仍是独立写入，保持既有行为。"""
+        ws, page = self.make_ws(record_count=1)
+        a = self.store.add_record(ws["id"], page, "普通记录A")
+        b = self.store.add_record(ws["id"], page, "普通记录B")
+        self.assertNotEqual(a["id"], b["id"])
+        self.assertFalse(a["replayed"])
+        self.assertEqual([a["seq"], b["seq"]], [2, 3])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,13 @@
   + 失效旧页面一次提交）。发布前后，旧页面的迟到保存一律被拒绝并提示重新载入。
 - 页面在复制/校验/发布之间关闭时，依据持久化阶段恢复：
   复制中 -> 安全回收候选；校验中 -> 保留同一候选等待续用；发布中 -> 立即完成发布。
+- 稳定保存标识（save_refs）：离线页面「已提交但未获回执」的保存携带客户端生成的
+  save_id 与其产生时的纪元。同一标识只能被接受一次：
+    * 已接受 -> 任何重试都稳定返回同一业务结果，迁移后也不会重复记录；
+    * 未接受过但来自旧纪元 -> 按纪元围栏拒绝，不能借重开的新页面变成新纪元写入；
+    * 同一标识内容不同 -> 明确冲突（409 save_id_conflict）。
+  发布在同一事务内把 save_refs 改指新纪元中同一 seq 的记录；复制回收、校验失败、
+  进程重开都不会丢失或错误归属已接受的保存。
 """
 
 from __future__ import annotations
@@ -62,6 +69,19 @@ CREATE TABLE IF NOT EXISTS records (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_records_epoch ON records(epoch_id, seq);
+-- 已接受保存的稳定标识：同一 (workspace, save_id) 全局唯一，内容不同即冲突。
+-- 跨纪元迁移时，发布事务会把 record_id 原子改指新纪元中同一 seq 的记录。
+CREATE TABLE IF NOT EXISTS save_refs (
+  save_id TEXT NOT NULL,
+  workspace_id TEXT NOT NULL,
+  epoch_id TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, save_id)
+);
+CREATE INDEX IF NOT EXISTS idx_save_refs_record ON save_refs(record_id);
 CREATE TABLE IF NOT EXISTS pages (
   id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL,
@@ -82,6 +102,16 @@ def utcnow() -> str:
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def copied_record_id(candidate_epoch_id: str, source_record_id: str) -> str:
+    """候选纪元中复制记录的确定性 ID：同一 (候选, 源记录) 永远得到同一 ID。
+
+    这样发布事务能稳定地把 save_refs.record_id 从源记录改指到复制记录，
+    中断重开、重新复制也不会产生第二条复制记录或错误归属。
+    """
+    digest = hashlib.sha256(f"{candidate_epoch_id}\x1f{source_record_id}".encode()).hexdigest()[:24]
+    return f"rec_{digest}"
 
 
 class ApiError(Exception):
@@ -319,7 +349,14 @@ class Store:
 
     def add_record(self, ws_id: str, page_id: str, content: str,
                    save_id: str = "", origin_epoch_id: str = "") -> dict:
-        """写入记录。发布前后旧页面的迟到保存一律被拒绝并提示重新载入。"""
+        """写入记录。发布前后旧页面的迟到保存一律被拒绝并提示重新载入。
+
+        携带 save_id 的保存是「保留的稳定保存」：
+        - 该标识已被接受：稳定返回同一业务结果（无论是否已跨纪元），绝不重复记录；
+        - 标识相同但内容不同：明确冲突 409 save_id_conflict；
+        - 从未被接受、但来自旧纪元（origin_epoch_id 指向非当前纪元）：
+          按纪元围栏拒绝，不能借重开页面持有的新纪元围栏变成新纪元写入。
+        """
         content = (content or "").strip()
         save_id = (save_id or "").strip()
         origin_epoch_id = (origin_epoch_id or "").strip()
@@ -333,6 +370,29 @@ class Store:
             self._maintenance_locked(ws_id)
             with self._tx():
                 ws = self._ws(ws_id)
+
+                # 已接受的稳定保存优先处理：无论重试来自哪个页面、页面是否失效、
+                # 是否正在迁移、纪元是否已切换，都稳定返回同一业务结果（或明确冲突），
+                # 绝不因围栏状态变成重复写入或被当作新记录。
+                existing = None
+                if save_id:
+                    existing = self.conn.execute(
+                        "SELECT * FROM save_refs WHERE workspace_id=? AND save_id=?",
+                        (ws_id, save_id),
+                    ).fetchone()
+                if existing is not None:
+                    if existing["content"] != content:
+                        raise ApiError(409, "save_id_conflict",
+                                       "相同保存标识对应不同内容，存在冲突，请重新载入核对",
+                                       {"save_id": save_id,
+                                        "accepted_seq": existing["seq"],
+                                        "accepted_epoch_id": existing["epoch_id"]})
+                    return {"id": existing["record_id"], "seq": existing["seq"],
+                            "content": existing["content"],
+                            "epoch_id": existing["epoch_id"], "save_id": save_id,
+                            "origin_epoch_id": origin_epoch_id, "replayed": True}
+
+                # 以下均为「未接受过」的写入：保持既有的页面/纪元围栏校验。
                 page = self._page(page_id)
                 if page is None or page["workspace_id"] != ws_id:
                     raise ApiError(404, "page_not_found", "页面不存在，请重新载入")
@@ -346,19 +406,36 @@ class Store:
                 if page["epoch_id"] != ws["current_epoch_id"]:
                     raise ApiError(409, "stale_epoch",
                                    "工作区已切换到新纪元，本次保存被拒绝，请重新载入")
+
+                # 从未被接受的保留保存：其产生时的纪元必须仍是当前纪元。
+                # 迁移已发布后才到达（或借重开的新页面重放）的旧纪元保存在此被拒，
+                # 不能借新页面持有的新纪元围栏变成新纪元写入。
+                if origin_epoch_id and origin_epoch_id != ws["current_epoch_id"]:
+                    raise ApiError(409, "stale_epoch",
+                                   "该保存来自旧纪元，纪元已迁移，保存被拒绝，请重新载入",
+                                   {"origin_epoch_id": origin_epoch_id,
+                                    "current_epoch_id": ws["current_epoch_id"]})
+
                 seq = self.conn.execute(
                     "SELECT COALESCE(MAX(seq),0)+1 AS s FROM records WHERE epoch_id=?",
                     (ws["current_epoch_id"],),
                 ).fetchone()["s"]
                 rec_id = new_id("rec")
+                now = utcnow()
                 self.conn.execute(
                     "INSERT INTO records(id,workspace_id,epoch_id,seq,content,created_at) "
                     "VALUES(?,?,?,?,?,?)",
-                    (rec_id, ws_id, ws["current_epoch_id"], seq, content, utcnow()),
+                    (rec_id, ws_id, ws["current_epoch_id"], seq, content, now),
                 )
+                if save_id:
+                    self.conn.execute(
+                        "INSERT INTO save_refs(save_id,workspace_id,epoch_id,record_id,"
+                        "seq,content,created_at) VALUES(?,?,?,?,?,?,?)",
+                        (save_id, ws_id, ws["current_epoch_id"], rec_id, seq, content, now),
+                    )
                 return {"id": rec_id, "seq": seq, "content": content,
                         "epoch_id": ws["current_epoch_id"], "save_id": save_id,
-                        "origin_epoch_id": origin_epoch_id}
+                        "origin_epoch_id": origin_epoch_id, "replayed": False}
 
     # ---------------------------------------------------------------- 迁移
 
@@ -431,15 +508,19 @@ class Store:
                 cand = ws["migration_candidate_epoch_id"]
                 copied = ws["migration_copied"]
                 rows = self.conn.execute(
-                    "SELECT seq, content, created_at FROM records "
+                    "SELECT id, seq, content, created_at FROM records "
                     "WHERE epoch_id=? ORDER BY seq LIMIT ? OFFSET ?",
                     (src, batch_size, copied),
                 ).fetchall()
                 for r in rows:
+                    # 确定性 ID：复制中断后重开/重试也只会是同一条候选记录，
+                    # 且发布时 save_refs 能按此 ID 精确改指。
                     self.conn.execute(
-                        "INSERT INTO records(id,workspace_id,epoch_id,seq,content,created_at) "
+                        "INSERT OR IGNORE INTO records("
+                        "id,workspace_id,epoch_id,seq,content,created_at) "
                         "VALUES(?,?,?,?,?,?)",
-                        (new_id("rec"), ws_id, cand, r["seq"], r["content"], r["created_at"]),
+                        (copied_record_id(cand, r["id"]), ws_id, cand,
+                         r["seq"], r["content"], r["created_at"]),
                     )
                 copied += len(rows)
                 total = ws["migration_total"]
@@ -515,6 +596,15 @@ class Store:
             return False
         self.conn.execute("UPDATE epochs SET kind='superseded' WHERE id=?", (old,))
         self.conn.execute("UPDATE epochs SET kind='published' WHERE id=?", (cand,))
+        # 已接受保存的稳定标识原子改指新纪元中同一 seq 的复制记录：
+        # 发布后重试同一 save_id 仍返回同一条业务结果（新记录 ID），不会重复写入。
+        # 发布前复核已保证 seq/内容逐行一致，按 seq 改指不会错误归属。
+        self.conn.execute(
+            "UPDATE save_refs SET epoch_id=?, "
+            "record_id=(SELECT id FROM records WHERE epoch_id=? AND seq=save_refs.seq) "
+            "WHERE workspace_id=? AND epoch_id=?",
+            (cand, cand, ws["id"], old),
+        )
         # 持有旧纪元围栏的页面全部失效：其后的迟到保存会被拒绝
         self.conn.execute(
             "UPDATE pages SET state='invalidated', invalidated_at=? "

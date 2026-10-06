@@ -61,15 +61,35 @@ async function submitRecord(content) {
   }
 }
 
+// 终态拒绝：该保留保存不可能再被接受，继续保留只会反复打扰，移除并提示用户。
+// migration_in_progress（409）不在其列：迁移可能中断回收，稍后仍应重试。
+const TERMINAL_SAVE_ERRORS = new Set([
+  "stale_epoch_save", "save_content_conflict", "stale_epoch", "page_not_active",
+]);
+
 async function flushPendingSaves() {
+  const rejected = [];
   for (const save of readPendingSaves()) {
     try {
-      await sendRecord(save);
+      const r = await sendRecord(save);
+      // 200 + replayed：请求其实在断线前已落库，服务端稳定返回原业务结果，未重复写入
       removePendingSave(save.id);
+      if (r.replayed) {
+        showBanner(`未获回执的保存「${save.content}」已确认（幂等重放，未重复写入）。`, false);
+      }
     } catch (e) {
-      if (!e.status) return;
-      removePendingSave(save.id);
+      if (!e.status) return;                       // 网络错误：继续保留，下次再试
+      if (TERMINAL_SAVE_ERRORS.has(e.code)) {
+        // 旧纪元保存或标识冲突：明确拒绝，不能借新页面变成新纪元写入
+        removePendingSave(save.id);
+        rejected.push(save.content);
+      }
+      // migration_in_progress 等可重试 409：保留到下次 flush
     }
+  }
+  if (rejected.length) {
+    showBanner(`以下断线前的保存属于旧纪元，已被明确拒绝且未写入，请重新录入：${
+      rejected.map((c) => `「${c}」`).join("、")}`, true);
   }
 }
 

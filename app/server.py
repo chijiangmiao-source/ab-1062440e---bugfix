@@ -169,9 +169,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def h_record_add(self, ws_id, query):
         body = self._read_json()
-        self._send_json(201, self.store.add_record(
+        result = self.store.add_record(
             ws_id, body.get("page_id", ""), body.get("content", ""),
-            body.get("save_id", ""), body.get("origin_epoch_id", "")))
+            body.get("save_id", ""), body.get("origin_epoch_id", ""))
+        # 首次接受 201；同一保存标识的幂等重放 200，业务结果（记录/seq）稳定不变
+        self._send_json(200 if result.get("replayed") else 201, result)
 
     def h_mig_start(self, ws_id, query):
         body = self._read_json()

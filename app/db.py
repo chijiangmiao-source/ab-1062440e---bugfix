@@ -9,6 +9,18 @@
   + 失效旧页面一次提交）。发布前后，旧页面的迟到保存一律被拒绝并提示重新载入。
 - 页面在复制/校验/发布之间关闭时，依据持久化阶段恢复：
   复制中 -> 安全回收候选；校验中 -> 保留同一候选等待续用；发布中 -> 立即完成发布。
+
+离线「保留保存」的幂等规则（save_id 由客户端在首次发送前生成并随重放稳定携带）：
+
+- 每个被接受的保存与记录在同一事务登记到 save_ops（按 纪元+save_id 唯一）。
+  同一保存操作的重放稳定返回首次接受时的业务结果（同一条记录、同一 seq），
+  无论重放发生在哪个纪元、页面是否已失效、迁移是否进行中——绝不二次写入。
+- 从未被接受的保存重放时，若其声明的来源纪元（origin_epoch_id）已不是当前纪元，
+  一律以 stale_epoch_save 拒绝：旧纪元的编辑不能借新纪元的页面越界写入。
+- 相同 save_id 但内容不同 -> save_content_conflict，明确冲突，不覆盖不接受。
+- 复制会把保存账本随记录一同复制并重新归属到候选纪元；校验与发布前复核同时比对
+  记录摘要与账本摘要；候选回收（含复制中断、失败重试）一并清掉候选账本，
+  已发布纪元的账本永久保留，保证重放结果稳定。
 """
 
 from __future__ import annotations
@@ -62,6 +74,22 @@ CREATE TABLE IF NOT EXISTS records (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_records_epoch ON records(epoch_id, seq);
+-- 离线保留保存的幂等账本：被接受的保存与业务记录同事务登记，永久保留，
+-- 支撑「已提交但未获回执」的稳定重放（恰好一次）。
+CREATE TABLE IF NOT EXISTS save_ops (
+  workspace_id TEXT NOT NULL,
+  epoch_id TEXT NOT NULL,          -- 保存被接受时所属纪元（复制迁移时重新归属候选）
+  save_id TEXT NOT NULL,
+  record_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (workspace_id, epoch_id, save_id)
+);
+-- 重放热路径：工作区内按稳定保存标识定位（跨纪元）
+CREATE INDEX IF NOT EXISTS idx_save_ops_ws_save ON save_ops(workspace_id, save_id);
+-- 复制/校验：按纪元扫描账本（主键左前缀是 workspace_id，无法直接用）
+CREATE INDEX IF NOT EXISTS idx_save_ops_epoch ON save_ops(epoch_id);
 CREATE TABLE IF NOT EXISTS pages (
   id TEXT PRIMARY KEY,
   workspace_id TEXT NOT NULL,
@@ -158,6 +186,23 @@ class Store:
             h.update(b"\n")
         return (len(rows), h.hexdigest())
 
+    def _save_checksum(self, epoch_id: str) -> tuple[int, str]:
+        """纪元保存账本的 (条目数, 摘要)：复制迁移必须连幂等账本一并完整复制。
+
+        只纳入跨纪元稳定的属性（save_id/seq/content）；record_id 在候选纪元会
+        重新生成，属于纪元内映射，不参与跨纪元一致性比对。
+        """
+        rows = self.conn.execute(
+            "SELECT save_id, seq, content FROM save_ops "
+            "WHERE epoch_id=? ORDER BY seq, save_id", (epoch_id,)
+        ).fetchall()
+        h = hashlib.sha256()
+        for r in rows:
+            h.update(f"{r['save_id']}|{r['seq']}|".encode())
+            h.update(r["content"].encode())
+            h.update(b"\n")
+        return (len(rows), h.hexdigest())
+
     def _require_driver(self, ws: sqlite3.Row, page: sqlite3.Row | None):
         """迁移操作只能由持有当前纪元围栏的活动页面发起。"""
         if page is None or page["workspace_id"] != ws["id"]:
@@ -193,6 +238,7 @@ class Store:
         if phase == "copying":
             # 复制可能只完成了一部分：安全回收候选，绝不展示部分复制的数据
             if cand:
+                self.conn.execute("DELETE FROM save_ops WHERE epoch_id=?", (cand,))
                 self.conn.execute("DELETE FROM records WHERE epoch_id=?", (cand,))
                 self.conn.execute("DELETE FROM epochs WHERE id=?", (cand,))
             self.conn.execute(
@@ -317,9 +363,28 @@ class Store:
 
     # ---------------------------------------------------------------- 记录
 
+    def _find_save(self, ws: sqlite3.Row, save_id: str) -> sqlite3.Row | None:
+        """按稳定保存标识查找已被接受的保存（跨纪元，优先当前纪元）。"""
+        rows = self.conn.execute(
+            "SELECT o.*, e.number AS epoch_number FROM save_ops o "
+            "JOIN epochs e ON e.id = o.epoch_id "
+            "WHERE o.workspace_id=? AND o.save_id=? ORDER BY e.number DESC",
+            (ws["id"], save_id),
+        ).fetchall()
+        if not rows:
+            return None
+        for r in rows:
+            if r["epoch_id"] == ws["current_epoch_id"]:
+                return r
+        return rows[0]
+
     def add_record(self, ws_id: str, page_id: str, content: str,
                    save_id: str = "", origin_epoch_id: str = "") -> dict:
-        """写入记录。发布前后旧页面的迟到保存一律被拒绝并提示重新载入。"""
+        """写入记录。
+
+        幂等规则见模块说明：带 save_id 的重放若曾被接受，无视页面围栏/迁移阶段
+        稳定返回首次接受的业务结果（replayed=True）；未接受过的旧纪元保存一律拒绝。
+        """
         content = (content or "").strip()
         save_id = (save_id or "").strip()
         origin_epoch_id = (origin_epoch_id or "").strip()
@@ -336,6 +401,31 @@ class Store:
                 page = self._page(page_id)
                 if page is None or page["workspace_id"] != ws_id:
                     raise ApiError(404, "page_not_found", "页面不存在，请重新载入")
+
+                # 幂等重放优先于一切围栏/阶段检查：已接受的保存必须在任何状态下
+                # （迁移中、页面失效、纪元切换后）稳定返回同一条业务结果，绝不重复写入。
+                if save_id:
+                    saved = self._find_save(ws, save_id)
+                    if saved is not None:
+                        if saved["content"] != content:
+                            raise ApiError(
+                                409, "save_content_conflict",
+                                "相同保存标识但内容不同，存在冲突，本次保存被拒绝",
+                                {"save_id": save_id, "accepted_epoch_id": saved["epoch_id"],
+                                 "accepted_seq": saved["seq"]})
+                        return {"id": saved["record_id"], "seq": saved["seq"],
+                                "content": saved["content"], "epoch_id": saved["epoch_id"],
+                                "save_id": save_id, "origin_epoch_id": origin_epoch_id,
+                                "replayed": True}
+
+                # 从未被接受的保存，走常规围栏校验
+                # 旧纪元的保留保存优先判定：无论页面是否新开/是否已失效，来源纪元已
+                # 过期即终态拒绝，不能借新纪元页面变成新纪元写入。
+                if origin_epoch_id and origin_epoch_id != ws["current_epoch_id"]:
+                    raise ApiError(409, "stale_epoch_save",
+                                   "该保存来自旧纪元，纪元已迁移，本次保存被拒绝，请重新载入",
+                                   {"origin_epoch_id": origin_epoch_id,
+                                    "current_epoch_id": ws["current_epoch_id"]})
                 if page["state"] != "active":
                     raise ApiError(409, "page_not_active",
                                    "本页面已失效，保存被拒绝，请重新载入",
@@ -351,14 +441,38 @@ class Store:
                     (ws["current_epoch_id"],),
                 ).fetchone()["s"]
                 rec_id = new_id("rec")
+                now = utcnow()
+                # 先登记保存账本（唯一约束兜底并发重放），再写业务记录：
+                # 账本冲突时本事务尚未写入任何记录，提交为空事务，绝不会重复落库。
+                if save_id:
+                    try:
+                        self.conn.execute(
+                            "INSERT INTO save_ops(workspace_id,epoch_id,save_id,record_id,"
+                            "seq,content,created_at) VALUES(?,?,?,?,?,?,?)",
+                            (ws_id, ws["current_epoch_id"], save_id, rec_id, seq, content, now),
+                        )
+                    except sqlite3.IntegrityError:
+                        # 并发重放（如两个标签页同时恢复同一保留保存）：另一事务已登记，
+                        # 返回其业务结果或内容冲突。
+                        other = self._find_save(ws, save_id)
+                        if other is not None and other["content"] != content:
+                            raise ApiError(
+                                409, "save_content_conflict",
+                                "相同保存标识但内容不同，存在冲突，本次保存被拒绝",
+                                {"save_id": save_id, "accepted_epoch_id": other["epoch_id"],
+                                 "accepted_seq": other["seq"]})
+                        return {"id": other["record_id"], "seq": other["seq"],
+                                "content": other["content"], "epoch_id": other["epoch_id"],
+                                "save_id": save_id, "origin_epoch_id": origin_epoch_id,
+                                "replayed": True}
                 self.conn.execute(
                     "INSERT INTO records(id,workspace_id,epoch_id,seq,content,created_at) "
                     "VALUES(?,?,?,?,?,?)",
-                    (rec_id, ws_id, ws["current_epoch_id"], seq, content, utcnow()),
+                    (rec_id, ws_id, ws["current_epoch_id"], seq, content, now),
                 )
                 return {"id": rec_id, "seq": seq, "content": content,
                         "epoch_id": ws["current_epoch_id"], "save_id": save_id,
-                        "origin_epoch_id": origin_epoch_id}
+                        "origin_epoch_id": origin_epoch_id, "replayed": False}
 
     # ---------------------------------------------------------------- 迁移
 
@@ -380,6 +494,7 @@ class Store:
                 # 上一次 failed 遗留的候选先回收
                 old_cand = ws["migration_candidate_epoch_id"]
                 if old_cand:
+                    self.conn.execute("DELETE FROM save_ops WHERE epoch_id=?", (old_cand,))
                     self.conn.execute("DELETE FROM records WHERE epoch_id=?", (old_cand,))
                     self.conn.execute("DELETE FROM epochs WHERE id=?", (old_cand,))
                 number = self.conn.execute(
@@ -431,16 +546,35 @@ class Store:
                 cand = ws["migration_candidate_epoch_id"]
                 copied = ws["migration_copied"]
                 rows = self.conn.execute(
-                    "SELECT seq, content, created_at FROM records "
+                    "SELECT id, seq, content, created_at FROM records "
                     "WHERE epoch_id=? ORDER BY seq LIMIT ? OFFSET ?",
                     (src, batch_size, copied),
                 ).fetchall()
+                id_map: dict[str, str] = {}
                 for r in rows:
+                    new_rec = new_id("rec")
+                    id_map[r["id"]] = new_rec
                     self.conn.execute(
                         "INSERT INTO records(id,workspace_id,epoch_id,seq,content,created_at) "
                         "VALUES(?,?,?,?,?,?)",
-                        (new_id("rec"), ws_id, cand, r["seq"], r["content"], r["created_at"]),
+                        (new_rec, ws_id, cand, r["seq"], r["content"], r["created_at"]),
                     )
+                # 保存账本随记录一并复制并重新归属候选纪元：
+                # 已接受保存的重放在新纪元仍幂等，且不依赖旧纪元存活
+                if id_map:
+                    ops = self.conn.execute(
+                        "SELECT save_id, record_id, seq, content, created_at FROM save_ops "
+                        "WHERE epoch_id=? AND record_id IN (%s)" %
+                        ",".join("?" * len(id_map)),
+                        (src, *id_map.keys()),
+                    ).fetchall()
+                    for o in ops:
+                        self.conn.execute(
+                            "INSERT INTO save_ops(workspace_id,epoch_id,save_id,record_id,"
+                            "seq,content,created_at) VALUES(?,?,?,?,?,?,?)",
+                            (ws_id, cand, o["save_id"], id_map[o["record_id"]],
+                             o["seq"], o["content"], o["created_at"]),
+                        )
                 copied += len(rows)
                 total = ws["migration_total"]
                 new_phase = "validating" if copied >= total else "copying"
@@ -467,8 +601,10 @@ class Store:
                     (page_id, ws_id))
                 src_sum = self._checksum(ws["migration_source_epoch_id"])
                 cand_sum = self._checksum(ws["migration_candidate_epoch_id"])
+                src_ops = self._save_checksum(ws["migration_source_epoch_id"])
+                cand_ops = self._save_checksum(ws["migration_candidate_epoch_id"])
                 now = utcnow()
-                if src_sum == cand_sum:
+                if src_sum == cand_sum and src_ops == cand_ops:
                     self.conn.execute(
                         "UPDATE workspaces SET migration_phase='publishing', "
                         "migration_error=NULL, migration_updated_at=? WHERE id=?",
@@ -478,7 +614,8 @@ class Store:
                     self.conn.execute(
                         "UPDATE workspaces SET migration_phase='failed', migration_error=?, "
                         "migration_updated_at=? WHERE id=?",
-                        (f"校验失败：源 {src_sum[0]} 条 / 候选 {cand_sum[0]} 条或内容摘要不一致",
+                        (f"校验失败：记录 源{src_sum[0]}条/候选{cand_sum[0]}条 或保存账本 "
+                         f"源{src_ops[0]}条/候选{cand_ops[0]}条 的摘要不一致",
                          now, ws_id),
                     )
         return self.get_state(ws_id)
@@ -505,12 +642,13 @@ class Store:
         if not cand:
             return False
         now = utcnow()
-        # 发布前复核：候选必须与源纪元一致，否则标记失败而不是发布半成品
-        if self._checksum(old) != self._checksum(cand):
+        # 发布前复核：候选的记录与保存账本都必须与源纪元一致，否则标记失败而不是发布半成品
+        if (self._checksum(old) != self._checksum(cand)
+                or self._save_checksum(old) != self._save_checksum(cand)):
             self.conn.execute(
                 "UPDATE workspaces SET migration_phase='failed', migration_error=?, "
                 "migration_updated_at=? WHERE id=?",
-                ("发布前复核不一致，已中止发布", now, ws["id"]),
+                ("发布前复核不一致（记录或保存账本），已中止发布", now, ws["id"]),
             )
             return False
         self.conn.execute("UPDATE epochs SET kind='superseded' WHERE id=?", (old,))

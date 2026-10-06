@@ -30,6 +30,8 @@ sh scripts/verify.sh
 `verify` 服务在编排网络内穿插执行：构建检查（编译/导入/静态资源）→ 单元测试 →
 健康与页面 HTTP 冒烟 → API 冒烟 → 场景一（两页面迁移 + 旧写拒绝 + 并发迁移不建
 第二候选）→ 场景二（复制中断重开不展示部分数据 + 校验阶段续用同一候选）→
+场景四（保留保存恢复：已提交未回执迁移后恰好一次 / 未提交即断线旧纪元明确拒绝 /
+同标识内容冲突 / 两页面旧写拒绝 / 复制中断后完整旧纪元账本不丢）→
 场景三（`POST /api/admin/shutdown` 触发进程退出，编排层按 `restart: unless-stopped`
 拉起后，校验本地恢复的纪元/记录/失效状态一致）。跑完自行退出，退出码即结果。
 
@@ -49,6 +51,15 @@ idle ──发起迁移──▶ copying ──复制完成──▶ validating 
 - **发布**：单事务完成指针切换、旧纪元作废、旧纪元围栏页面全部失效。
 - **迟到保存**：迁移进行中（发布前）与页面失效/纪元切换后（发布后），写入一律
   409 并提示"请重新载入"。
+- **保留保存（离线幂等）**：客户端在首次发送前为保存生成稳定 `save_id`，断线未获
+  回执时本地保留，重开后原样重放（携带记录时的来源纪元 `origin_epoch_id`）。
+  - 已被接受：无视围栏/阶段/纪元，稳定返回首次接受时的业务结果（同一条记录、同一
+    `seq`，响应 `replayed: true`，HTTP 200），**绝不二次写入**。
+  - 从未被接受且来源纪元已过期：`409 stale_epoch_save` 明确拒绝，旧纪元编辑不能借
+    新页面变成新纪元写入。
+  - 相同 `save_id` 但内容不同：`409 save_content_conflict`，明确冲突，不覆盖不接受。
+  - 幂等账本随迁移复制重新归属到候选纪元，校验/发布前复核同时比对记录与账本摘要；
+    候选回收（复制中断、失败重试）一并清理候选账本，已发布纪元账本永久保留。
 - **恢复**：页面在复制/校验/发布之间关闭（显式关闭、心跳过期或进程重启），
   由后来页面或下次启动依据持久化阶段恢复：copying→回收候选；validating→保留
   同一候选待续；publishing→补齐发布。
@@ -63,7 +74,7 @@ idle ──发起迁移──▶ copying ──复制完成──▶ validating 
 | POST | `/api/workspaces/{id}/pages` | 打开页面（在当前纪元建立围栏） |
 | POST | `/api/workspaces/{id}/pages/{pid}/heartbeat` | 心跳 |
 | POST/DELETE | `/api/workspaces/{id}/pages/{pid}/close` | 关闭页面 |
-| POST | `/api/workspaces/{id}/records` | 写记录（校验围栏/失效/迁移中） |
+| POST | `/api/workspaces/{id}/records` | 写记录（校验围栏/失效/迁移中；带 `save_id` 幂等：201 首次接受 / 200 重放；旧纪元未接受保存 409 `stale_epoch_save`；内容冲突 409 `save_content_conflict`） |
 | POST | `.../migration/start` `copy` `validate` `publish` | 迁移四步 |
 | POST | `/api/admin/shutdown` | 进程退出（需 `ALLOW_ADMIN_SHUTDOWN=1`，仅供编排验收） |
 
@@ -73,7 +84,7 @@ idle ──发起迁移──▶ copying ──复制完成──▶ validating 
 app/db.py        纪元/迁移状态机存储层（SQLite，WAL）
 app/server.py    HTTP API + 静态页
 app/static/      记录页前端
-tests/           单元测试（12 例）
+tests/           单元测试（19 例）
 verify.py        编排内验收服务（退出码报告结果）
 docker-compose.yml / Dockerfile / scripts/verify.sh
 ```

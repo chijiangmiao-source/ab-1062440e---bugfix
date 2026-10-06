@@ -228,6 +228,180 @@ class StoreTestCase(unittest.TestCase):
         self.assertEqual(states[page_b], "invalidated")
         self.assertEqual(after["migration"]["phase"], "published")
 
+    # ------------------------------------------------------------ 保留保存的幂等
+
+    def test_accepted_save_replays_once_after_migration(self):
+        """已提交但未获回执：迁移后重放稳定返回原结果，绝不二次写入。"""
+        ws, page_a = self.make_ws(record_count=2)
+        page_b = self.store.open_page(ws["id"])["page_id"]
+        old_epoch = ws["current_epoch"]["id"]
+        # 请求在迁移前落库（客户端未收到回执）
+        r1 = self.store.add_record(ws["id"], page_a, "离线保留记录",
+                                   save_id="save-1", origin_epoch_id=old_epoch)
+        self.assertFalse(r1["replayed"])
+        self.assertEqual(r1["seq"], 3)
+
+        self.drive_to(ws["id"], page_b, "published")
+        # 重开旧页面：围栏已失效，但幂等重放优先于一切围栏检查
+        r2 = self.store.add_record(ws["id"], page_a, "离线保留记录",
+                                   save_id="save-1", origin_epoch_id=old_epoch)
+        self.assertTrue(r2["replayed"])
+        self.assertEqual(r2["seq"], r1["seq"])
+        self.assertEqual(r2["content"], "离线保留记录")
+        # 再用新纪元的新页面重放：仍是同一条，记录数恰好一次
+        page_c = self.store.open_page(ws["id"])["page_id"]
+        r3 = self.store.add_record(ws["id"], page_c, "离线保留记录",
+                                   save_id="save-1", origin_epoch_id=old_epoch)
+        self.assertTrue(r3["replayed"])
+        cur_epoch = self.store.get_state(ws["id"])["current_epoch"]["id"]
+        self.assertEqual(r3["epoch_id"], cur_epoch)
+        s = self.store.get_state(ws["id"])
+        self.assertEqual(len(s["records"]), 3)
+        self.assertEqual([r["content"] for r in s["records"]],
+                         ["观测记录-1", "观测记录-2", "离线保留记录"])
+
+    def test_replay_stable_during_migration_with_invalid_page(self):
+        """迁移进行中 / 页面已失效时，已接受保存的重放仍稳定成功。"""
+        ws, page_a = self.make_ws(record_count=1)
+        old_epoch = ws["current_epoch"]["id"]
+        r1 = self.store.add_record(ws["id"], page_a, "保留记录",
+                                   save_id="s-x", origin_epoch_id=old_epoch)
+        page_b = self.store.open_page(ws["id"])["page_id"]
+        self.store.start_migration(ws["id"], page_b, "v2")
+        # 迁移进行中：普通旧写被拒，但已接受保存的重放稳定返回
+        r2 = self.store.add_record(ws["id"], page_a, "保留记录",
+                                   save_id="s-x", origin_epoch_id=old_epoch)
+        self.assertTrue(r2["replayed"])
+        self.assertEqual(r2["id"], r1["id"])
+        self.assertEqual(len(self.store.get_state(ws["id"])["records"]), 2)
+
+    def test_unsubmitted_old_epoch_save_rejected_after_migration(self):
+        """未提交即断线：请求从未到达服务端，迁移后不能借新页面变成新纪元写入。"""
+        ws, page_a = self.make_ws(record_count=2)
+        old_epoch = ws["current_epoch"]["id"]
+        page_b = self.store.open_page(ws["id"])["page_id"]
+        self.drive_to(ws["id"], page_b, "published")
+
+        # 旧页面重放从未被接受的保存 -> 旧纪元终态拒绝
+        err = self.assert_api_error(
+            409, "stale_epoch_save", self.store.add_record,
+            ws["id"], page_a, "从未送达的记录",
+            save_id="never-sent", origin_epoch_id=old_epoch)
+        self.assertEqual(err.extra["origin_epoch_id"], old_epoch)
+        # 即便用新纪元的新页面重放，仍按来源纪元拒绝，不得写入新纪元
+        page_c = self.store.open_page(ws["id"])["page_id"]
+        self.assert_api_error(
+            409, "stale_epoch_save", self.store.add_record,
+            ws["id"], page_c, "从未送达的记录",
+            save_id="never-sent", origin_epoch_id=old_epoch)
+        s = self.store.get_state(ws["id"])
+        self.assertEqual(len(s["records"]), 2)  # 恰好只有迁移复制的两条
+        self.assertNotIn("从未送达的记录", [r["content"] for r in s["records"]])
+
+    def test_same_save_id_different_content_conflicts(self):
+        """相同稳定保存标识但内容不同：明确冲突，不覆盖不接受。"""
+        ws, page_a = self.make_ws(record_count=1)
+        old_epoch = ws["current_epoch"]["id"]
+        self.store.add_record(ws["id"], page_a, "原始内容",
+                              save_id="dup", origin_epoch_id=old_epoch)
+        err = self.assert_api_error(
+            409, "save_content_conflict", self.store.add_record,
+            ws["id"], page_a, "被篡改的内容", save_id="dup",
+            origin_epoch_id=old_epoch)
+        self.assertEqual(err.extra["accepted_seq"], 2)
+        # 迁移后冲突仍被检出，且账本以原始内容复制到新纪元
+        page_b = self.store.open_page(ws["id"])["page_id"]
+        self.drive_to(ws["id"], page_b, "published")
+        page_c = self.store.open_page(ws["id"])["page_id"]
+        self.assert_api_error(
+            409, "save_content_conflict", self.store.add_record,
+            ws["id"], page_c, "被篡改的内容", save_id="dup",
+            origin_epoch_id=old_epoch)
+        r = self.store.add_record(ws["id"], page_c, "原始内容",
+                                  save_id="dup", origin_epoch_id=old_epoch)
+        self.assertTrue(r["replayed"])
+        s = self.store.get_state(ws["id"])
+        self.assertEqual([x["content"] for x in s["records"]],
+                         ["观测记录-1", "原始内容"])
+
+    def test_save_ledger_copied_and_recycled_with_candidate(self):
+        """复制携带保存账本；复制中断回收候选不动旧纪元账本，重开后完整旧纪元仍可重放。"""
+        ws, page_a = self.make_ws(record_count=2)
+        old_epoch = ws["current_epoch"]["id"]
+        self.store.add_record(ws["id"], page_a, "带标识记录",
+                              save_id="led-1", origin_epoch_id=old_epoch)
+        # 复制中断：候选（含部分账本副本）被回收
+        self.store.start_migration(ws["id"], page_a, "v2")
+        self.store.copy_batch(ws["id"], page_a, 1)
+        self.store.close_page(ws["id"], page_a)
+        s = self.store.get_state(ws["id"])
+        self.assertEqual(s["migration"]["phase"], "aborted")
+        # 旧纪元账本完好：重放仍幂等
+        page_b = self.store.open_page(ws["id"])["page_id"]
+        r = self.store.add_record(ws["id"], page_b, "带标识记录",
+                                  save_id="led-1", origin_epoch_id=old_epoch)
+        self.assertTrue(r["replayed"])
+        self.assertEqual(len(s["records"]), 3)
+        cand_ops = self.store.conn.execute(
+            "SELECT COUNT(*) AS c FROM save_ops WHERE epoch_id != ?",
+            (old_epoch,)).fetchone()["c"]
+        self.assertEqual(cand_ops, 0)
+        # 完整再来一次迁移：账本复制到新纪元，跨纪元重放命中新纪元条目
+        self.drive_to(ws["id"], page_b, "published")
+        new_epoch = self.store.get_state(ws["id"])["current_epoch"]["id"]
+        n_new = self.store.conn.execute(
+            "SELECT COUNT(*) AS c FROM save_ops WHERE epoch_id=?", (new_epoch,)).fetchone()["c"]
+        self.assertEqual(n_new, 1)
+        page_c = self.store.open_page(ws["id"])["page_id"]
+        r = self.store.add_record(ws["id"], page_c, "带标识记录",
+                                  save_id="led-1", origin_epoch_id=old_epoch)
+        self.assertTrue(r["replayed"])
+        self.assertEqual(r["epoch_id"], new_epoch)
+        self.assertEqual(len(self.store.get_state(ws["id"])["records"]), 3)
+
+    def test_plain_new_record_behavior_unchanged(self):
+        """无 save_id 的普通写入行为保持：新建 201 语义，重复内容仍是独立记录。"""
+        ws, page_a = self.make_ws()
+        r1 = self.store.add_record(ws["id"], page_a, "普通记录")
+        r2 = self.store.add_record(ws["id"], page_a, "普通记录")
+        self.assertFalse(r1["replayed"])
+        self.assertFalse(r2["replayed"])
+        self.assertNotEqual(r1["id"], r2["id"])
+        self.assertEqual([r["seq"] for r in (r1, r2)], [1, 2])
+
+    def test_concurrent_replay_inserts_exactly_once(self):
+        """两个页面并发重放同一保留保存：只有一条记录，两者拿到同一业务结果。"""
+        import threading
+
+        ws, _ = self.make_ws()
+        page_x = self.store.open_page(ws["id"])["page_id"]
+        page_y = self.store.open_page(ws["id"])["page_id"]
+        old_epoch = ws["current_epoch"]["id"]
+        results: list = []
+        errors: list = []
+
+        def flush(pid):
+            try:
+                results.append(self.store.add_record(
+                    ws["id"], pid, "并发保留记录",
+                    save_id="race-1", origin_epoch_id=old_epoch))
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+
+        t1 = threading.Thread(target=flush, args=(page_x,))
+        t2 = threading.Thread(target=flush, args=(page_y,))
+        t1.start(); t2.start(); t1.join(); t2.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual({r["id"] for r in results}, {results[0]["id"]})
+        self.assertEqual({r["seq"] for r in results}, {1})
+        s = self.store.get_state(ws["id"])
+        self.assertEqual(len(s["records"]), 1)
+        self.assertEqual(s["records"][0]["content"], "并发保留记录")
+        ledger = self.store.conn.execute(
+            "SELECT COUNT(*) AS c FROM save_ops WHERE save_id='race-1'").fetchone()["c"]
+        self.assertEqual(ledger, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

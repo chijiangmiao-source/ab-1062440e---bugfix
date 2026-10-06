@@ -1,0 +1,35 @@
+services:
+  app:
+    build: .
+    image: epoch-field-station
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/app.db
+      PORT: "8000"
+      PAGE_TTL_SECONDS: "45"
+      ALLOW_ADMIN_SHUTDOWN: "1"   # 供 verify 验证崩溃恢复；生产应移除
+    volumes:
+      - app-data:/data
+    restart: unless-stopped       # verify 触发进程退出后由编排层拉起
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys;sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz',timeout=3).status==200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+  verify:
+    image: epoch-field-station
+    build: .
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      BASE_URL: http://app:8000
+    command: ["python", "verify.py"]
+    # 不配置重启策略：跑完自行退出，以退出码报告结果
+
+volumes:
+  app-data:

@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>野外实验站 · 离线记录页</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>野外实验站 · 离线记录页</h1>
+  <div class="ws-bar">
+    <label>工作区</label>
+    <select id="ws-select"></select>
+    <input id="ws-name" placeholder="新工作区名称" size="14">
+    <button id="ws-create">建立工作区</button>
+    <span class="hint">在新标签页打开本页即视为另一个“页面”，各自持有围栏</span>
+  </div>
+</header>
+
+<main>
+  <section class="cards">
+    <div class="card"><div class="label">当前纪元</div><div id="epoch" class="big">—</div></div>
+    <div class="card"><div class="label">迁移阶段</div><div id="phase" class="big">—</div></div>
+    <div class="card"><div class="label">本页面</div><div id="me" class="big">—</div></div>
+  </section>
+
+  <section id="banner" class="banner hidden"></section>
+
+  <section class="panel">
+    <h2>目标版本迁移</h2>
+    <div id="migration-info" class="muted">—</div>
+    <progress id="mig-progress" value="0" max="1"></progress>
+    <div class="row">
+      <input id="target-version" placeholder="目标版本，如 v2" size="12">
+      <button id="btn-start">发起迁移</button>
+      <button id="btn-copy">复制一批</button>
+      <button id="btn-validate">校验</button>
+      <button id="btn-publish">原子发布</button>
+      <button id="btn-auto" class="primary">一键完成迁移</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>记录（仅来自当前已发布纪元）</h2>
+    <div class="row">
+      <input id="rec-content" placeholder="录入观测记录…" size="42">
+      <button id="btn-add" class="primary">保存记录</button>
+    </div>
+    <ul id="records"></ul>
+  </section>
+
+  <section class="panel">
+    <h2>持有围栏的页面</h2>
+    <table>
+      <thead><tr><th>页面</th><th>围栏纪元</th><th>状态</th><th>最后活跃</th></tr></thead>
+      <tbody id="pages"></tbody>
+    </table>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>
